@@ -42,15 +42,9 @@ def _last_token(x: str) -> str:
     """
     Extract the last taxonomic rank from a taxonomy string.
 
-    Examples:
-    k__Bacteria|p__Firmicutes|g__Streptococcus|s__Streptococcus_gordonii
-    -> Streptococcus_gordonii
-
-    d__Bacteria; p__Firmicutes; g__Streptococcus
-    -> Streptococcus
-
-    Streptococcus_gordonii
-    -> Streptococcus_gordonii
+    Example:
+    Bacteria|Bacillota|Clostridia|Lachnospirales|Lachnospiraceae|Lachnoclostridium|Lachnoclostridium_phytofermentans
+    -> Lachnoclostridium_phytofermentans
     """
     x = str(x).strip()
     parts = re.split(r"[|;]", x)
@@ -83,6 +77,63 @@ def _genus_token(x: str) -> str:
         return last.split("_")[0].strip()
 
     return last.strip()
+
+
+def _species_token(x: str):
+    """
+    Extract species name from taxonomy string.
+    Return None if species-level information is not detected.
+    """
+    x = str(x).strip()
+    parts = re.split(r"[|;]", x)
+    parts = [p.strip() for p in parts if p.strip()]
+
+    # Explicit species label
+    for p in reversed(parts):
+        p = p.strip()
+
+        if p.startswith("s__"):
+            sp = p.replace("s__", "").strip()
+            if sp and sp.lower() not in ["unassigned", "unknown", "uncultured", "none", "nan"]:
+                return sp
+
+        if p.startswith("D_6__"):
+            sp = p.replace("D_6__", "").strip()
+            if sp and sp.lower() not in ["unassigned", "unknown", "uncultured", "none", "nan"]:
+                return sp
+
+    # Fallback: last rank looks like Genus_species
+    last = _last_token(x)
+
+    if "_" in last:
+        pieces = last.split("_")
+        if len(pieces) >= 2 and pieces[0] and pieces[1]:
+            if last.lower() not in ["unassigned", "unknown", "uncultured", "none", "nan"]:
+                return last
+
+    return None
+
+
+def format_display_label(x: str, mode: str = "Last taxonomic rank") -> str:
+    """
+    Format labels for heatmap display only.
+    This does not change the actual analysis table or downloaded CSV.
+    """
+    x = str(x).strip()
+
+    if mode == "Original":
+        return x
+
+    if mode == "Last taxonomic rank":
+        return _last_token(x)
+
+    if mode == "Species only":
+        sp = _species_token(x)
+        if sp is not None:
+            return sp
+        return _last_token(x)
+
+    return x
 
 
 def shorten_label(x: str, max_len: int = 35) -> str:
@@ -118,7 +169,7 @@ def parse_manual_taxa(taxa_input: str) -> List[str]:
 def prepare_taxa_table(
     df: pd.DataFrame,
     taxa_list: List[str],
-    label_mode: str = "Use table labels as-is",
+    label_mode: str = "Use species-level only",
     match_mode: str = "Exact match",
     case_sensitive: bool = False,
 ) -> Tuple[pd.DataFrame, List[str]]:
@@ -126,12 +177,22 @@ def prepare_taxa_table(
     Prepare taxa/features x samples table.
 
     Rule:
-    - If taxa_list is empty, use all taxa/features.
+    - If taxa_list is empty, use all taxa/features after selected label mode.
     - If taxa_list is not empty, filter by user input.
     """
     df2 = df.copy()
 
     # Convert all values to numeric
+    df2 = (
+        df2.astype(str)
+        .replace("%", "", regex=True)
+        .replace(",", "", regex=True)
+        .replace("-", "0")
+        .replace("NA", "0")
+        .replace("N/A", "0")
+        .replace("nan", "0")
+        .replace("None", "0")
+    )
     df2 = df2.apply(pd.to_numeric, errors="coerce").fillna(0)
 
     # Handle row labels
@@ -140,6 +201,16 @@ def prepare_taxa_table(
 
     elif label_mode == "Use last taxonomic rank":
         df2.index = pd.Index([_last_token(i) for i in df2.index])
+        df2 = df2.groupby(df2.index).sum()
+
+    elif label_mode == "Use species-level only":
+        species_names = [_species_token(i) for i in df2.index]
+        keep = [s is not None for s in species_names]
+
+        df2 = df2.loc[keep]
+        species_names = [s for s in species_names if s is not None]
+
+        df2.index = pd.Index(species_names)
         df2 = df2.groupby(df2.index).sum()
 
     elif label_mode == "Use genus-level and merge":
@@ -153,7 +224,9 @@ def prepare_taxa_table(
     df2.index = pd.Index([str(i).strip() for i in df2.index])
     df2 = df2.loc[df2.index != ""]
     df2 = df2.loc[
-        ~df2.index.str.lower().isin(["nan", "none", "unassigned", "unknown"])
+        ~df2.index.str.lower().isin(
+            ["nan", "none", "unassigned", "unknown", "uncultured"]
+        )
     ]
 
     missing_terms: List[str] = []
@@ -323,6 +396,7 @@ def draw_heatmap(
     linewidths: float,
     shorten_plot_labels: bool,
     max_label_len: int,
+    display_label_mode: str,
 ) -> plt.Figure:
     """Draw heatmap."""
     if show_mode == "Show significant only":
@@ -332,6 +406,17 @@ def draw_heatmap(
 
     plot_df = plot_values.copy()
 
+    # Display label formatting only
+    plot_df.index = [
+        format_display_label(i, mode=display_label_mode)
+        for i in plot_df.index
+    ]
+    plot_df.columns = [
+        format_display_label(i, mode=display_label_mode)
+        for i in plot_df.columns
+    ]
+
+    # Optional shortening after extracting last rank/species
     if shorten_plot_labels:
         plot_df.index = [
             shorten_label(i, max_len=max_label_len)
@@ -419,6 +504,15 @@ with st.sidebar:
         ),
     )
 
+    transpose_table = st.checkbox(
+        "Transpose table",
+        value=False,
+        help=(
+            "Turn samples × taxa into taxa × samples. "
+            "Use this if your bacteria are columns."
+        ),
+    )
+
     st.header("🔎 Taxa / Species filter")
 
     label_mode = st.selectbox(
@@ -426,13 +520,14 @@ with st.sidebar:
         [
             "Use table labels as-is",
             "Use last taxonomic rank",
+            "Use species-level only",
             "Use genus-level and merge",
         ],
-        index=0,
+        index=2,
         help=(
-            "Use table labels as-is: keep uploaded row names. "
-            "Use last taxonomic rank: extract the final taxonomy level. "
-            "Use genus-level and merge: extract genus and sum duplicated genera."
+            "Use species-level only: keep species-level rows only. "
+            "Example: Bacteria|...|Lachnoclostridium_phytofermentans "
+            "will become Lachnoclostridium_phytofermentans."
         ),
     )
 
@@ -442,13 +537,13 @@ with st.sidebar:
         height=150,
         placeholder=(
             "Example:\n"
+            "Lachnoclostridium_phytofermentans\n"
             "Streptococcus_gordonii\n"
-            "Proteus_mirabilis\n"
             "Fusobacterium_nucleatum"
         ),
         help=(
             "Optional. Enter one per line or comma-separated. "
-            "Leave empty to use all taxa/features in the uploaded table."
+            "Leave empty to use all taxa/features under the selected label mode."
         ),
     )
 
@@ -504,6 +599,21 @@ with st.sidebar:
     )
 
     st.header("🎨 Plot")
+
+    display_label_mode = st.selectbox(
+        "Heatmap label display",
+        [
+            "Original",
+            "Last taxonomic rank",
+            "Species only",
+        ],
+        index=1,
+        help=(
+            "Original = show full taxonomy string. "
+            "Last taxonomic rank = show only the last part after | or ;. "
+            "Species only = try to show species name only."
+        ),
+    )
 
     show_mode = st.radio(
         "Heatmap display",
@@ -577,7 +687,7 @@ with st.sidebar:
 
     shorten_plot_labels = st.checkbox(
         "Shorten long labels on heatmap",
-        value=True,
+        value=False,
     )
 
     max_label_len = st.number_input(
@@ -599,9 +709,18 @@ if uploaded is None:
 
 df_raw = read_table(uploaded)
 
+if transpose_table:
+    df_raw = df_raw.T
+
 st.success(
     f"Loaded: {df_raw.shape[0]} rows × {df_raw.shape[1]} samples"
 )
+
+with st.expander("🔍 Raw uploaded table preview", expanded=False):
+    st.dataframe(
+        df_raw.iloc[:10, :10],
+        use_container_width=True,
+    )
 
 taxa_list = parse_manual_taxa(taxa_input)
 
@@ -620,7 +739,7 @@ if taxa_list:
 else:
     st.info(
         f"No manual filter applied. "
-        f"Using all available taxa/features: {df.shape[0]}."
+        f"Using all available taxa/features under selected mode: {df.shape[0]}."
     )
 
 if missing_terms:
@@ -634,7 +753,7 @@ if missing_terms:
 if df.empty:
     st.warning(
         "No taxa/features available after filtering. "
-        "Please check bacteria names or table format."
+        "Please check bacteria names, label mode, or table format."
     )
     st.stop()
 
@@ -713,6 +832,7 @@ fig = draw_heatmap(
     linewidths=linewidths,
     shorten_plot_labels=shorten_plot_labels,
     max_label_len=max_label_len,
+    display_label_mode=display_label_mode,
 )
 
 st.pyplot(
@@ -725,7 +845,8 @@ st.caption(
     f"Figure size: {fig_w:.1f} cm × {fig_h:.1f} cm | "
     f"Taxa/features: {df.shape[0]} | "
     f"Samples: {df.shape[1]} | "
-    f"Display mode: {show_mode}"
+    f"Display mode: {show_mode} | "
+    f"Label display: {display_label_mode}"
 )
 
 
