@@ -1,4 +1,6 @@
-# app_microcoheat.py
+from pathlib import Path
+
+code = r'''# app_microcoheat.py
 # Usage:
 #   streamlit run app_microcoheat.py
 
@@ -441,6 +443,7 @@ def draw_heatmap(
         vmax=1,
         vmin=-1,
         center=0,
+        square=True,
         xticklabels=True,
         yticklabels=True,
         annot=False,
@@ -449,6 +452,7 @@ def draw_heatmap(
         cbar_kws={
             "label": "Spearman correlation coefficient",
             "shrink": 0.75,
+            "pad": 0.03,
         },
         ax=ax,
     )
@@ -657,7 +661,7 @@ with st.sidebar:
         "Manual height (cm)",
         min_value=8.0,
         max_value=120.0,
-        value=26.0,
+        value=30.0,
         step=1.0,
     )
 
@@ -665,7 +669,7 @@ with st.sidebar:
         "Font size",
         min_value=3,
         max_value=20,
-        value=5,
+        value=8,
         step=1,
     )
 
@@ -673,7 +677,7 @@ with st.sidebar:
         "DPI",
         min_value=72,
         max_value=600,
-        value=300,
+        value=600,
         step=10,
     )
 
@@ -774,8 +778,9 @@ if df.shape[1] < 3:
 n_taxa = df.shape[0]
 
 if auto_fig_size:
-    fig_w = max(18.0, min(120.0, n_taxa * 0.75 + 10))
-    fig_h = max(16.0, min(120.0, n_taxa * 0.55 + 8))
+    fig_side = max(20.0, min(120.0, n_taxa * 0.75 + 10))
+    fig_w = fig_side
+    fig_h = fig_side
 else:
     fig_w = manual_fig_w
     fig_h = manual_fig_h
@@ -929,3 +934,9 @@ st.download_button(
 )
 
 plt.close(fig)
+'''
+
+path = Path("/mnt/data/app_microcoheat.py")
+path.write_text(code, encoding="utf-8")
+print(f"Created: {path}")
+print(f"Size: {path.stat().st_size:,} bytes")
