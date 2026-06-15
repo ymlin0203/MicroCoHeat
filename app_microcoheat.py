@@ -1,6 +1,4 @@
-from pathlib import Path
-
-code = r'''# app_microcoheat.py
+# app_microcoheat.py
 # Usage:
 #   streamlit run app_microcoheat.py
 
@@ -96,12 +94,24 @@ def _species_token(x: str):
 
         if p.startswith("s__"):
             sp = p.replace("s__", "").strip()
-            if sp and sp.lower() not in ["unassigned", "unknown", "uncultured", "none", "nan"]:
+            if sp and sp.lower() not in [
+                "unassigned",
+                "unknown",
+                "uncultured",
+                "none",
+                "nan",
+            ]:
                 return sp
 
         if p.startswith("D_6__"):
             sp = p.replace("D_6__", "").strip()
-            if sp and sp.lower() not in ["unassigned", "unknown", "uncultured", "none", "nan"]:
+            if sp and sp.lower() not in [
+                "unassigned",
+                "unknown",
+                "uncultured",
+                "none",
+                "nan",
+            ]:
                 return sp
 
     # Fallback: last rank looks like Genus_species
@@ -110,7 +120,13 @@ def _species_token(x: str):
     if "_" in last:
         pieces = last.split("_")
         if len(pieces) >= 2 and pieces[0] and pieces[1]:
-            if last.lower() not in ["unassigned", "unknown", "uncultured", "none", "nan"]:
+            if last.lower() not in [
+                "unassigned",
+                "unknown",
+                "uncultured",
+                "none",
+                "nan",
+            ]:
                 return last
 
     return None
@@ -934,9 +950,3 @@ st.download_button(
 )
 
 plt.close(fig)
-'''
-
-path = Path("/mnt/data/app_microcoheat.py")
-path.write_text(code, encoding="utf-8")
-print(f"Created: {path}")
-print(f"Size: {path.stat().st_size:,} bytes")
