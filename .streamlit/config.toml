@@ -1,0 +1,4 @@
+[browser]
+# Skips the usage-stats network ping on startup (can add latency on a slow
+# or restricted network, and is unnecessary for a personal/lab tool).
+gatherUsageStats = false

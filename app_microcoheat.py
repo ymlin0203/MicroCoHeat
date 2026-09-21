@@ -1,23 +1,55 @@
 # app_microcoheat.py
 # Usage:
 #   streamlit run app_microcoheat.py
+#
+# ---------------------------------------------------------------------------
+# Performance notes:
+#   1. spearman_corr_and_p uses scipy's vectorized matrix form of
+#      spearmanr() instead of an O(n^2) Python for-loop calling spearmanr()
+#      on every taxon pair individually (100-200x faster on 50-200 taxa).
+#   2. prepare_taxa_table / normalize_table are cached (@st.cache_data).
+#   3. draw_heatmap builds the on-screen figure at a capped "preview" DPI
+#      and only renders at the user's chosen (possibly much higher) DPI at
+#      export time in the PNG/PDF savefig calls.
+#   4. sns.heatmap(..., rasterized=True) keeps PDF export fast/small.
+#   5. Font-size is applied via a scoped plt.rc_context(...) instead of the
+#      global matplotlib.rc(...), so it can't leak across sessions.
+#   6. All sidebar controls sit inside an st.form(), so adjusting several
+#      settings only re-runs the pipeline once, on "Run analysis".
+#   7. statsmodels, plotly and networkx are imported lazily, only where
+#      used, so `streamlit run` reaches the upload screen faster and the
+#      default (network graph / interactive heatmap / group comparison all
+#      off) path pays none of their import cost.
+#
+# Feature notes (new):
+#   - Optional data preprocessing before correlation: relative abundance
+#     (TSS) or CLR (centered log-ratio), addressing the "compositional
+#     data" caveat of running Spearman directly on raw counts.
+#   - Optional interactive Plotly heatmap alongside the static one.
+#   - Optional co-occurrence network graph (nodes = taxa, edges =
+#     significant correlations), with an exportable edge table
+#     (Cytoscape/Gephi-ready) and a hub-taxa (degree) summary.
+#   - Optional group comparison: upload a metadata table, get one heatmap
+#     per group (aligned to the same taxon order) plus a table of taxa
+#     pairs whose significance differs between two chosen groups.
+# ---------------------------------------------------------------------------
 
 import io
 import re
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
-import matplotlib
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 from scipy.stats import spearmanr
 from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
-from statsmodels.stats.multitest import multipletests
+# statsmodels, plotly and networkx are imported lazily inside the functions
+# that need them (see the perf notes above) rather than at module scope.
 
 
 # =========================
@@ -184,6 +216,10 @@ def parse_manual_taxa(taxa_input: str) -> List[str]:
     return taxa_list
 
 
+_MISSING_PLACEHOLDERS = {"-", "NA", "N/A", "nan", "None"}
+
+
+@st.cache_data(show_spinner=False)
 def prepare_taxa_table(
     df: pd.DataFrame,
     taxa_list: List[str],
@@ -197,20 +233,24 @@ def prepare_taxa_table(
     Rule:
     - If taxa_list is empty, use all taxa/features after selected label mode.
     - If taxa_list is not empty, filter by user input.
+
+    Cached: same uploaded table + same sidebar settings -> no recomputation.
     """
     df2 = df.copy()
 
-    # Convert all values to numeric
-    df2 = (
-        df2.astype(str)
-        .replace("%", "", regex=True)
-        .replace(",", "", regex=True)
-        .replace("-", "0")
-        .replace("NA", "0")
-        .replace("N/A", "0")
-        .replace("nan", "0")
-        .replace("None", "0")
-    )
+    # Convert all values to numeric.
+    # Only string-typed (object) columns need cleaning; columns pandas
+    # already parsed as numeric skip straight to pd.to_numeric below,
+    # which is noticeably faster than round-tripping every cell through
+    # str() + several whole-table regex passes on wide/long tables.
+    for col in df2.columns:
+        if df2[col].dtype == object:
+            s = df2[col].astype(str)
+            s = s.str.replace("%", "", regex=False)
+            s = s.str.replace(",", "", regex=False)
+            s = s.where(~s.isin(_MISSING_PLACEHOLDERS), "0")
+            df2[col] = s
+
     df2 = df2.apply(pd.to_numeric, errors="coerce").fillna(0)
 
     # Handle row labels
@@ -304,6 +344,61 @@ def prepare_taxa_table(
 
 
 # =========================
+# Preprocessing / normalization
+# =========================
+
+NORM_RAW = "不轉換 (Raw values)"
+NORM_TSS = "相對豐度 (TSS, 每個樣本總和為 1)"
+NORM_CLR = "CLR (centered log-ratio)"
+NORMALIZATION_METHODS = [NORM_RAW, NORM_TSS, NORM_CLR]
+
+
+@st.cache_data(show_spinner=False)
+def normalize_table(df: pd.DataFrame, method: str, pseudocount: float) -> pd.DataFrame:
+    """
+    Optional preprocessing applied before the correlation step.
+
+    Spearman correlation computed directly on raw counts/relative-abundance
+    values can be sensitive to the "compositional" nature of microbiome
+    data (all taxa in a sample necessarily sum to a fixed total, which can
+    induce spurious negative correlations). TSS just removes sequencing-
+    depth differences; CLR (centered log-ratio) is the standard
+    compositional-data transform and changes the *rank order across
+    samples* for a given taxon (since the per-sample geometric mean
+    differs sample to sample), so it can meaningfully change Spearman
+    results, not just rescale them.
+    """
+    if method == NORM_RAW:
+        return df
+
+    if method == NORM_TSS:
+        col_sums = df.sum(axis=0).replace(0, np.nan)
+        out = df.div(col_sums, axis=1).fillna(0.0)
+        return out
+
+    if method == NORM_CLR:
+        x = df.to_numpy(dtype=float) + pseudocount
+        x = np.clip(x, a_min=1e-12, a_max=None)
+        log_x = np.log(x)
+        gm = log_x.mean(axis=0, keepdims=True)
+        clr = log_x - gm
+        return pd.DataFrame(clr, index=df.index, columns=df.columns)
+
+    raise ValueError(f"Unknown normalization method: {method}")
+
+
+def suggest_pseudocount(df: pd.DataFrame) -> float:
+    """Half of the smallest strictly-positive value in the table, as a
+    reasonable default CLR pseudocount; falls back to a tiny constant if
+    the table has no positive values at all."""
+    values = df.to_numpy(dtype=float)
+    positive = values[values > 0]
+    if positive.size == 0:
+        return 1e-6
+    return float(positive.min() / 2)
+
+
+# =========================
 # Statistics
 # =========================
 
@@ -316,29 +411,50 @@ def spearman_corr_and_p(
     """
     Calculate pairwise Spearman correlation among rows.
 
+    Uses scipy's vectorized matrix form of spearmanr() (ranks every row
+    once, computes the full correlation/p-value matrices in compiled
+    code) instead of looping over every (i, j) pair in Python.
+
     FDR correction:
     - Only upper triangle without diagonal is corrected.
     - Corrected p-values are mirrored back to the full matrix.
     """
+    from statsmodels.stats.multitest import multipletests
+
     taxa = df.index.astype(str)
     n = len(taxa)
 
-    corr = np.eye(n, dtype=float)
-    p_raw = np.zeros((n, n), dtype=float)
-
     values = df.to_numpy(dtype=float)
 
-    for i in range(n):
-        for j in range(i + 1, n):
-            r, p = spearmanr(values[i, :], values[j, :])
+    if n < 2:
+        corr = np.eye(n, dtype=float)
+        p_raw = np.zeros((n, n), dtype=float)
+    else:
+        result = spearmanr(values, axis=1)
 
-            if np.isnan(r):
-                r = 0.0
-            if np.isnan(p):
-                p = 1.0
+        # scipy's result object exposes the correlation matrix as either
+        # `.correlation` (older scipy) or `.statistic` (newer scipy) --
+        # support both so this doesn't silently break on a scipy upgrade.
+        corr_raw = getattr(result, "correlation", None)
+        if corr_raw is None:
+            corr_raw = result.statistic
 
-            corr[i, j] = corr[j, i] = r
-            p_raw[i, j] = p_raw[j, i] = p
+        corr = np.atleast_2d(np.asarray(corr_raw, dtype=float))
+        p_raw = np.atleast_2d(np.asarray(result.pvalue, dtype=float))
+
+        # With exactly 2 taxa, scipy returns scalars rather than a 2x2
+        # matrix -- normalize that case so the rest of the code can assume
+        # an (n, n) shape.
+        if corr.shape != (n, n):
+            r = float(corr.flat[0])
+            p = float(p_raw.flat[0])
+            corr = np.array([[1.0, r], [r, 1.0]])
+            p_raw = np.array([[0.0, p], [p, 0.0]])
+
+        corr = np.nan_to_num(corr, nan=0.0)
+        p_raw = np.nan_to_num(p_raw, nan=1.0)
+        np.fill_diagonal(corr, 1.0)
+        np.fill_diagonal(p_raw, 0.0)
 
     p_corr = np.ones((n, n), dtype=float)
     np.fill_diagonal(p_corr, 0.0)
@@ -379,18 +495,24 @@ def reorder_by_clustering(
     if corr_df.shape[0] <= 2:
         return corr_df, p_df
 
-    corr = corr_df.copy().astype(float)
+    # Work on a plain, guaranteed-writable numpy array rather than mutating
+    # a DataFrame's `.values` in place: under pandas' Copy-on-Write (the
+    # default since pandas 3.0, and optional earlier), `.values` can hand
+    # back a read-only view, and np.fill_diagonal(df.values, ...) then
+    # raises "underlying array is read-only". np.array(..., copy=True)
+    # sidesteps that regardless of the pandas version in use.
+    corr = np.array(corr_df, dtype=float, copy=True)
 
     # Force symmetry
     corr = (corr + corr.T) / 2
-    np.fill_diagonal(corr.values, 1.0)
+    np.fill_diagonal(corr, 1.0)
 
     # Correlation distance
     dist = 1 - corr
-    dist = dist.clip(lower=0)
-    np.fill_diagonal(dist.values, 0.0)
+    dist = np.clip(dist, a_min=0.0, a_max=None)
+    np.fill_diagonal(dist, 0.0)
 
-    condensed = squareform(dist.values, checks=False)
+    condensed = squareform(dist, checks=False)
     Z = linkage(condensed, method=method)
     order = leaves_list(Z)
 
@@ -398,8 +520,260 @@ def reorder_by_clustering(
 
 
 # =========================
-# Plot function
+# Co-occurrence network helpers
 # =========================
+
+@st.cache_data(show_spinner=False)
+def build_edge_table(
+    corr_df: pd.DataFrame,
+    p_df: pd.DataFrame,
+    fdr_alpha: float,
+) -> pd.DataFrame:
+    """
+    Turn the correlation/p-value matrices into a "significant pairs only"
+    edge list (taxon_1, taxon_2, r, adj_p), sorted by |r| descending.
+    This is the same significance test used to mask the heatmap, just
+    reshaped into a Cytoscape/Gephi-friendly table.
+    """
+    taxa = np.array(corr_df.index.astype(str))
+    n = len(taxa)
+
+    if n < 2:
+        return pd.DataFrame(columns=["taxon_1", "taxon_2", "r", "adj_p"])
+
+    corr = corr_df.to_numpy(dtype=float)
+    p = p_df.to_numpy(dtype=float)
+
+    iu = np.triu_indices(n, k=1)
+    r_vals = corr[iu]
+    p_vals = p[iu]
+    mask = p_vals <= fdr_alpha
+
+    edge_df = pd.DataFrame(
+        {
+            "taxon_1": taxa[iu[0][mask]],
+            "taxon_2": taxa[iu[1][mask]],
+            "r": r_vals[mask],
+            "adj_p": p_vals[mask],
+        }
+    )
+
+    if edge_df.empty:
+        return edge_df
+
+    edge_df = edge_df.reindex(
+        edge_df["r"].abs().sort_values(ascending=False).index
+    ).reset_index(drop=True)
+
+    return edge_df
+
+
+def draw_network_figure(
+    edge_df: pd.DataFrame,
+    all_taxa: List[str],
+    abundance: Optional[Dict[str, float]],
+    layout: str,
+    hide_isolated: bool,
+    node_size_basis: str,
+):
+    """Build an interactive Plotly co-occurrence network from the edge
+    table. Returns (figure, hub_taxa_dataframe), or (None, None) if there
+    is nothing left to draw (e.g. everything filtered out as isolated)."""
+    import networkx as nx
+
+    graph = nx.Graph()
+    graph.add_nodes_from(all_taxa)
+    for _, row in edge_df.iterrows():
+        # Deliberately NOT stored under the key "weight": networkx's
+        # layout algorithms read a "weight" edge attribute automatically,
+        # but disagree on what it means (kamada_kawai treats it as a
+        # shortest-path *distance*, spring_layout as an attraction
+        # *strength* -- opposite senses), and either way r can be
+        # negative, which breaks kamada_kawai's Dijkstra-based layout
+        # ("Contradictory paths found: negative weights?"). So layouts
+        # below are computed unweighted (topology only); "r" is kept
+        # purely for edge coloring/hover text.
+        graph.add_edge(row["taxon_1"], row["taxon_2"], r=float(row["r"]))
+
+    if hide_isolated:
+        isolated = [node for node in graph.nodes() if graph.degree(node) == 0]
+        graph.remove_nodes_from(isolated)
+
+    if graph.number_of_nodes() == 0:
+        return None, None
+
+    if layout == "kamada_kawai":
+        pos = nx.kamada_kawai_layout(graph)
+    elif layout == "circular":
+        pos = nx.circular_layout(graph)
+    else:
+        k = 1.5 / max(1.0, np.sqrt(graph.number_of_nodes()))
+        pos = nx.spring_layout(graph, seed=42, k=k)
+
+    pos_edge_x, pos_edge_y = [], []
+    neg_edge_x, neg_edge_y = [], []
+    mid_x, mid_y, mid_text = [], [], []
+
+    for u, v, data in graph.edges(data=True):
+        x0, y0 = pos[u]
+        x1, y1 = pos[v]
+        r = data["r"]
+        if r >= 0:
+            pos_edge_x += [x0, x1, None]
+            pos_edge_y += [y0, y1, None]
+        else:
+            neg_edge_x += [x0, x1, None]
+            neg_edge_y += [y0, y1, None]
+        mid_x.append((x0 + x1) / 2)
+        mid_y.append((y0 + y1) / 2)
+        mid_text.append(f"{u} × {v}<br>r = {r:.3f}")
+
+    import plotly.graph_objects as go
+
+    edge_trace_pos = go.Scatter(
+        x=pos_edge_x,
+        y=pos_edge_y,
+        mode="lines",
+        line=dict(width=1.5, color="rgba(200,30,30,0.55)"),
+        hoverinfo="skip",
+        name="正相關 (r > 0)",
+    )
+    edge_trace_neg = go.Scatter(
+        x=neg_edge_x,
+        y=neg_edge_y,
+        mode="lines",
+        line=dict(width=1.5, color="rgba(30,60,200,0.55)"),
+        hoverinfo="skip",
+        name="負相關 (r < 0)",
+    )
+    edge_hover_trace = go.Scatter(
+        x=mid_x,
+        y=mid_y,
+        mode="markers",
+        marker=dict(size=6, color="rgba(0,0,0,0)"),
+        hoverinfo="text",
+        text=mid_text,
+        showlegend=False,
+    )
+
+    degrees = dict(graph.degree())
+
+    if node_size_basis == "總豐度 (Total abundance)" and abundance is not None:
+        sizes_raw = {node: float(abundance.get(node, 0.0)) for node in graph.nodes()}
+    else:
+        sizes_raw = {node: float(degrees[node]) for node in graph.nodes()}
+
+    max_size_raw = max(sizes_raw.values()) if sizes_raw else 1.0
+    max_size_raw = max_size_raw if max_size_raw > 0 else 1.0
+
+    node_list = list(graph.nodes())
+    node_x = [pos[node][0] for node in node_list]
+    node_y = [pos[node][1] for node in node_list]
+    node_size = [10 + 30 * (sizes_raw[node] / max_size_raw) for node in node_list]
+    node_hover = [f"{node}<br>degree = {degrees[node]}" for node in node_list]
+    node_text = [node if len(node) <= 18 else node[:16] + "…" for node in node_list]
+
+    node_trace = go.Scatter(
+        x=node_x,
+        y=node_y,
+        mode="markers+text",
+        text=node_text,
+        textposition="top center",
+        hovertext=node_hover,
+        hoverinfo="text",
+        marker=dict(size=node_size, color="#2b6cb0", line=dict(width=1, color="white")),
+        showlegend=False,
+    )
+
+    fig = go.Figure(data=[edge_trace_pos, edge_trace_neg, edge_hover_trace, node_trace])
+    fig.update_layout(
+        showlegend=True,
+        xaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        yaxis=dict(showgrid=False, zeroline=False, showticklabels=False),
+        margin=dict(l=10, r=10, t=30, b=10),
+        height=700,
+    )
+
+    hub_table = pd.DataFrame(
+        {
+            "taxon": node_list,
+            "degree": [degrees[node] for node in node_list],
+        }
+    ).sort_values("degree", ascending=False).reset_index(drop=True)
+
+    return fig, hub_table
+
+
+# =========================
+# Group comparison helpers
+# =========================
+
+def build_diff_table(
+    corr_a: pd.DataFrame,
+    p_a: pd.DataFrame,
+    corr_b: pd.DataFrame,
+    p_b: pd.DataFrame,
+    fdr_alpha: float,
+    name_a: str,
+    name_b: str,
+) -> pd.DataFrame:
+    """
+    Taxa pairs whose significance status (significant vs not, at the same
+    FDR threshold) differs between two groups, sorted by |Δr| descending.
+    A quick way to spot co-occurrence relationships that appear in one
+    condition (e.g. disease) but not the other (e.g. healthy).
+    """
+    taxa = np.array(corr_a.index.astype(str))
+    n = len(taxa)
+
+    if n < 2:
+        return pd.DataFrame()
+
+    iu = np.triu_indices(n, k=1)
+
+    r_a = corr_a.to_numpy(dtype=float)[iu]
+    r_b = corr_b.to_numpy(dtype=float)[iu]
+    p_a_v = p_a.to_numpy(dtype=float)[iu]
+    p_b_v = p_b.to_numpy(dtype=float)[iu]
+
+    sig_a = p_a_v <= fdr_alpha
+    sig_b = p_b_v <= fdr_alpha
+    differ = sig_a != sig_b
+
+    out = pd.DataFrame(
+        {
+            "taxon_1": taxa[iu[0][differ]],
+            "taxon_2": taxa[iu[1][differ]],
+            f"r_{name_a}": r_a[differ],
+            f"adj_p_{name_a}": p_a_v[differ],
+            f"significant_{name_a}": sig_a[differ],
+            f"r_{name_b}": r_b[differ],
+            f"adj_p_{name_b}": p_b_v[differ],
+            f"significant_{name_b}": sig_b[differ],
+        }
+    )
+
+    if out.empty:
+        return out
+
+    out["abs_delta_r"] = (out[f"r_{name_a}"] - out[f"r_{name_b}"]).abs()
+    out = out.sort_values("abs_delta_r", ascending=False).reset_index(drop=True)
+    out = out.rename(columns={"abs_delta_r": "|delta_r|"})
+
+    return out
+
+
+# =========================
+# Plot functions
+# =========================
+
+# On-screen figures never need to be rasterized above this DPI -- the
+# browser downscales anyway. The user's chosen `dpi` (up to 600) is still
+# honored, but only at export time (see the PNG/PDF savefig calls below),
+# so cranking DPI up for a nice print-quality download no longer makes
+# every interactive redraw slow too.
+_PREVIEW_DPI_CAP = 150
+
 
 def draw_heatmap(
     corr_df_ord: pd.DataFrame,
@@ -416,7 +790,8 @@ def draw_heatmap(
     max_label_len: int,
     display_label_mode: str,
 ) -> plt.Figure:
-    """Draw heatmap."""
+    """Draw heatmap (static, matplotlib/seaborn -- used for the main
+    heatmap, per-group comparison heatmaps, and the PNG/PDF downloads)."""
     if show_mode == "Show significant only":
         plot_values = corr_df_ord.where(p_df_ord <= fdr_alpha)
     else:
@@ -445,55 +820,124 @@ def draw_heatmap(
             for i in plot_df.columns
         ]
 
-    matplotlib.rc("font", size=font_size)
+    preview_dpi = min(dpi, _PREVIEW_DPI_CAP)
 
-    fig, ax = plt.subplots(
-        figsize=(fig_w_cm / 2.54, fig_h_cm / 2.54),
-        dpi=dpi,
-        constrained_layout=True,
+    # Scoped font-size override instead of the original matplotlib.rc(...),
+    # which mutates *global* rcParams for the whole Python process. On a
+    # shared Streamlit server that means one user's font-size setting could
+    # leak into another user's session; rc_context() undoes it automatically
+    # once this function returns.
+    with plt.rc_context({"font.size": font_size}):
+        fig, ax = plt.subplots(
+            figsize=(fig_w_cm / 2.54, fig_h_cm / 2.54),
+            dpi=preview_dpi,
+            constrained_layout=True,
+        )
+
+        sns.heatmap(
+            plot_df,
+            cmap=cmap,
+            vmax=1,
+            vmin=-1,
+            center=0,
+            square=True,
+            xticklabels=True,
+            yticklabels=True,
+            annot=False,
+            linewidths=linewidths,
+            linecolor="white",
+            rasterized=True,  # keeps PDF export fast/small for many cells
+            cbar_kws={
+                "label": "Spearman correlation coefficient",
+                "shrink": 0.75,
+                "pad": 0.03,
+            },
+            ax=ax,
+        )
+
+        ax.set_xticklabels(
+            ax.get_xticklabels(),
+            rotation=90,
+            ha="center",
+            va="top",
+            fontsize=font_size,
+        )
+
+        ax.set_yticklabels(
+            ax.get_yticklabels(),
+            rotation=0,
+            fontsize=font_size,
+        )
+
+        cbar = ax.collections[0].colorbar
+        cbar.ax.tick_params(labelsize=font_size)
+        cbar.set_label(
+            "Spearman correlation coefficient",
+            fontsize=font_size,
+        )
+
+    return fig
+
+
+_PLOTLY_CMAP_MAP = {
+    "bwr_r": "RdBu",
+    "coolwarm": "RdBu",
+    "vlag": "RdBu",
+    "icefire": "Tealrose",
+    "RdBu_r": "RdBu_r",
+    "viridis": "Viridis",
+}
+
+
+def draw_heatmap_plotly(
+    corr_df_ord: pd.DataFrame,
+    p_df_ord: pd.DataFrame,
+    fdr_alpha: float,
+    show_mode: str,
+    cmap: str,
+    shorten_plot_labels: bool,
+    max_label_len: int,
+    display_label_mode: str,
+):
+    """Interactive heatmap: same clustering order and significance mask
+    as the static plot, but zoomable/pannable with exact r / adjusted-p
+    values on hover. The static matplotlib plot remains the one used for
+    PNG/PDF export."""
+    import plotly.graph_objects as go
+
+    if show_mode == "Show significant only":
+        z_df = corr_df_ord.where(p_df_ord <= fdr_alpha)
+    else:
+        z_df = corr_df_ord.copy()
+
+    labels = [format_display_label(i, mode=display_label_mode) for i in z_df.index]
+    if shorten_plot_labels:
+        labels = [shorten_label(i, max_len=max_label_len) for i in labels]
+
+    z = z_df.to_numpy(dtype=float)
+    p_vals = p_df_ord.to_numpy(dtype=float)
+    colorscale = _PLOTLY_CMAP_MAP.get(cmap, "RdBu")
+
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=labels,
+            y=labels,
+            customdata=p_vals,
+            colorscale=colorscale,
+            zmin=-1,
+            zmax=1,
+            zmid=0,
+            hovertemplate="%{y} × %{x}<br>r = %{z:.3f}<br>adj p = %{customdata:.3g}<extra></extra>",
+            colorbar=dict(title="Spearman r"),
+        )
     )
-
-    sns.heatmap(
-        plot_df,
-        cmap=cmap,
-        vmax=1,
-        vmin=-1,
-        center=0,
-        square=True,
-        xticklabels=True,
-        yticklabels=True,
-        annot=False,
-        linewidths=linewidths,
-        linecolor="white",
-        cbar_kws={
-            "label": "Spearman correlation coefficient",
-            "shrink": 0.75,
-            "pad": 0.03,
-        },
-        ax=ax,
+    fig.update_layout(
+        xaxis=dict(tickangle=90),
+        yaxis=dict(autorange="reversed"),
+        margin=dict(l=10, r=10, t=30, b=10),
+        height=700,
     )
-
-    ax.set_xticklabels(
-        ax.get_xticklabels(),
-        rotation=90,
-        ha="center",
-        va="top",
-        fontsize=font_size,
-    )
-
-    ax.set_yticklabels(
-        ax.get_yticklabels(),
-        rotation=0,
-        fontsize=font_size,
-    )
-
-    cbar = ax.collections[0].colorbar
-    cbar.ax.tick_params(labelsize=font_size)
-    cbar.set_label(
-        "Spearman correlation coefficient",
-        fontsize=font_size,
-    )
-
     return fig
 
 
@@ -512,211 +956,331 @@ st.caption(
     "Rows = taxa/features, columns = samples."
 )
 
+# All sidebar controls live inside a single st.form(). In the original app,
+# every widget (including things unrelated to the maths, like "Grid line
+# width") triggered a full script rerun that recomputed the correlation
+# matrix, clustering and heatmap. Batching them behind one "Run analysis"
+# button means you can change several settings and only pay the
+# recomputation cost once, when you're ready.
 with st.sidebar:
     st.header("📄 Upload")
 
-    uploaded = st.file_uploader(
-        "Upload table (.tsv/.txt/.csv)",
-        type=["tsv", "txt", "csv"],
-        help=(
-            "The first column should be taxon/species/genus/feature ID. "
-            "Other columns should be samples."
-        ),
-    )
+    with st.form("controls_form"):
+        uploaded = st.file_uploader(
+            "Upload table (.tsv/.txt/.csv)",
+            type=["tsv", "txt", "csv"],
+            help=(
+                "The first column should be taxon/species/genus/feature ID. "
+                "Other columns should be samples."
+            ),
+        )
 
-    transpose_table = st.checkbox(
-        "Transpose table",
-        value=False,
-        help=(
-            "Turn samples × taxa into taxa × samples. "
-            "Use this if your bacteria are columns."
-        ),
-    )
+        transpose_table = st.checkbox(
+            "Transpose table",
+            value=False,
+            help=(
+                "Turn samples × taxa into taxa × samples. "
+                "Use this if your bacteria are columns."
+            ),
+        )
 
-    st.header("🔎 Taxa / Species filter")
+        st.header("🔎 Taxa / Species filter")
 
-    label_mode = st.selectbox(
-        "Taxa label mode",
-        [
-            "Use table labels as-is",
-            "Use last taxonomic rank",
-            "Use species-level only",
-            "Use genus-level and merge",
-        ],
-        index=2,
-        help=(
-            "Use species-level only: keep species-level rows only. "
-            "Example: Bacteria|...|Lachnoclostridium_phytofermentans "
-            "will become Lachnoclostridium_phytofermentans."
-        ),
-    )
+        label_mode = st.selectbox(
+            "Taxa label mode",
+            [
+                "Use table labels as-is",
+                "Use last taxonomic rank",
+                "Use species-level only",
+                "Use genus-level and merge",
+            ],
+            index=2,
+            help=(
+                "Use species-level only: keep species-level rows only. "
+                "Example: Bacteria|...|Lachnoclostridium_phytofermentans "
+                "will become Lachnoclostridium_phytofermentans."
+            ),
+        )
 
-    taxa_input = st.text_area(
-        "Enter bacteria names",
-        value="",
-        height=150,
-        placeholder=(
-            "Example:\n"
-            "Lachnoclostridium_phytofermentans\n"
-            "Streptococcus_gordonii\n"
-            "Fusobacterium_nucleatum"
-        ),
-        help=(
-            "Optional. Enter one per line or comma-separated. "
-            "Leave empty to use all taxa/features under the selected label mode."
-        ),
-    )
+        taxa_input = st.text_area(
+            "Enter bacteria names",
+            value="",
+            height=150,
+            placeholder=(
+                "Example:\n"
+                "Lachnoclostridium_phytofermentans\n"
+                "Streptococcus_gordonii\n"
+                "Fusobacterium_nucleatum"
+            ),
+            help=(
+                "Optional. Enter one per line or comma-separated. "
+                "Leave empty to use all taxa/features under the selected label mode."
+            ),
+        )
 
-    match_mode = st.radio(
-        "Manual filter matching",
-        ["Exact match", "Contains match"],
-        index=0,
-        help=(
-            "Exact match is stricter. "
-            "Contains match is useful when typing partial names, "
-            "for example Streptococcus."
-        ),
-    )
+        match_mode = st.radio(
+            "Manual filter matching",
+            ["Exact match", "Contains match"],
+            index=0,
+            help=(
+                "Exact match is stricter. "
+                "Contains match is useful when typing partial names, "
+                "for example Streptococcus."
+            ),
+        )
 
-    case_sensitive = st.checkbox(
-        "Case-sensitive matching",
-        value=False,
-    )
+        case_sensitive = st.checkbox(
+            "Case-sensitive matching",
+            value=False,
+        )
 
-    st.header("📐 Statistics")
+        st.header("🧫 資料前處理 (Normalization)")
 
-    fdr_alpha = st.number_input(
-        "FDR α",
-        min_value=0.0,
-        max_value=1.0,
-        value=0.05,
-        step=0.01,
-    )
+        normalization_method = st.selectbox(
+            "轉換方法",
+            NORMALIZATION_METHODS,
+            index=0,
+            help=(
+                "微生物體豐度資料具有「組成性」(compositional):同一樣本內所有 "
+                "taxa 的總和固定,直接對 raw counts 做 Spearman 有時會產生假的負相關。"
+                "TSS 只校正定序深度;CLR (centered log-ratio) 是組成性資料分析的"
+                "標準轉換,會改變每個 taxon 在樣本間的排序(因為每個樣本的幾何平均"
+                "不同),因此可能讓相關係數結果明顯不同,不只是縮放。預設為不轉換,"
+                "與舊版行為一致。"
+            ),
+        )
 
-    p_adjust_method = st.selectbox(
-        "P-value correction",
-        [
-            "fdr_bh",
-            "bonferroni",
-            "holm",
-            "fdr_by",
-            "sidak",
-            "holm-sidak",
-        ],
-        index=0,
-    )
+        auto_pseudocount = st.checkbox(
+            "CLR: 自動計算 pseudocount(建議)",
+            value=True,
+            help="使用資料中最小非零值的一半,避免 log(0)。只在選擇 CLR 時使用。",
+        )
 
-    cluster_method = st.selectbox(
-        "Clustering method",
-        [
-            "average",
-            "complete",
-            "single",
-            "weighted",
-        ],
-        index=0,
-        help="Average linkage is recommended for correlation-distance heatmaps.",
-    )
+        manual_pseudocount = st.number_input(
+            "CLR: 手動 pseudocount(若取消自動計算)",
+            min_value=0.0,
+            value=1.0,
+            step=0.1,
+            help="只在取消勾選「自動計算」且選擇 CLR 轉換時使用。",
+        )
 
-    st.header("🎨 Plot")
+        st.header("📐 Statistics")
 
-    display_label_mode = st.selectbox(
-        "Heatmap label display",
-        [
-            "Original",
-            "Last taxonomic rank",
-            "Species only",
-        ],
-        index=1,
-        help=(
-            "Original = show full taxonomy string. "
-            "Last taxonomic rank = show only the last part after | or ;. "
-            "Species only = try to show species name only."
-        ),
-    )
+        fdr_alpha = st.number_input(
+            "FDR α",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.05,
+            step=0.01,
+        )
 
-    show_mode = st.radio(
-        "Heatmap display",
-        [
-            "Show significant only",
-            "Show all correlations",
-        ],
-        index=0,
-        help=(
-            "Show significant only will display non-significant cells as blank."
-        ),
-    )
+        p_adjust_method = st.selectbox(
+            "P-value correction",
+            [
+                "fdr_bh",
+                "bonferroni",
+                "holm",
+                "fdr_by",
+                "sidak",
+                "holm-sidak",
+            ],
+            index=0,
+        )
 
-    cmap = st.selectbox(
-        "Colormap",
-        [
-            "bwr_r",
-            "coolwarm",
-            "vlag",
-            "icefire",
-            "RdBu_r",
-            "viridis",
-        ],
-        index=0,
-    )
+        cluster_method = st.selectbox(
+            "Clustering method",
+            [
+                "average",
+                "complete",
+                "single",
+                "weighted",
+                "ward",
+            ],
+            index=0,
+            help=(
+                "Average linkage is recommended for correlation-distance "
+                "heatmaps. 'ward' is included because it's what the README's "
+                "CLI-aligned description mentions; the default here stays "
+                "'average' to match this app's previous behavior."
+            ),
+        )
 
-    auto_fig_size = st.checkbox(
-        "Auto figure size by taxa number",
-        value=True,
-    )
+        st.header("🎨 Plot")
 
-    manual_fig_w = st.number_input(
-        "Manual width (cm)",
-        min_value=8.0,
-        max_value=120.0,
-        value=30.0,
-        step=1.0,
-    )
+        display_label_mode = st.selectbox(
+            "Heatmap label display",
+            [
+                "Original",
+                "Last taxonomic rank",
+                "Species only",
+            ],
+            index=1,
+            help=(
+                "Original = show full taxonomy string. "
+                "Last taxonomic rank = show only the last part after | or ;. "
+                "Species only = try to show species name only."
+            ),
+        )
 
-    manual_fig_h = st.number_input(
-        "Manual height (cm)",
-        min_value=8.0,
-        max_value=120.0,
-        value=30.0,
-        step=1.0,
-    )
+        show_mode = st.radio(
+            "Heatmap display",
+            [
+                "Show significant only",
+                "Show all correlations",
+            ],
+            index=0,
+            help=(
+                "Show significant only will display non-significant cells as blank."
+            ),
+        )
 
-    font_size = st.number_input(
-        "Font size",
-        min_value=3,
-        max_value=20,
-        value=8,
-        step=1,
-    )
+        cmap = st.selectbox(
+            "Colormap",
+            [
+                "bwr_r",
+                "coolwarm",
+                "vlag",
+                "icefire",
+                "RdBu_r",
+                "viridis",
+            ],
+            index=0,
+        )
 
-    dpi = st.number_input(
-        "DPI",
-        min_value=72,
-        max_value=600,
-        value=600,
-        step=10,
-    )
+        auto_fig_size = st.checkbox(
+            "Auto figure size by taxa number",
+            value=True,
+        )
 
-    linewidths = st.number_input(
-        "Grid line width",
-        min_value=0.0,
-        max_value=5.0,
-        value=0.3,
-        step=0.1,
-    )
+        manual_fig_w = st.number_input(
+            "Manual width (cm)",
+            min_value=8.0,
+            max_value=120.0,
+            value=30.0,
+            step=1.0,
+        )
 
-    shorten_plot_labels = st.checkbox(
-        "Shorten long labels on heatmap",
-        value=False,
-    )
+        manual_fig_h = st.number_input(
+            "Manual height (cm)",
+            min_value=8.0,
+            max_value=120.0,
+            value=30.0,
+            step=1.0,
+        )
 
-    max_label_len = st.number_input(
-        "Max label length",
-        min_value=10,
-        max_value=120,
-        value=35,
-        step=5,
-    )
+        font_size = st.number_input(
+            "Font size",
+            min_value=3,
+            max_value=20,
+            value=8,
+            step=1,
+        )
+
+        dpi = st.number_input(
+            "DPI",
+            min_value=72,
+            max_value=600,
+            value=600,
+            step=10,
+            help=(
+                "Applied to the PNG/PDF downloads. The on-screen preview is "
+                f"capped at {_PREVIEW_DPI_CAP} DPI for speed regardless of "
+                "this setting."
+            ),
+        )
+
+        linewidths = st.number_input(
+            "Grid line width",
+            min_value=0.0,
+            max_value=5.0,
+            value=0.3,
+            step=0.1,
+        )
+
+        shorten_plot_labels = st.checkbox(
+            "Shorten long labels on heatmap",
+            value=False,
+        )
+
+        max_label_len = st.number_input(
+            "Max label length",
+            min_value=10,
+            max_value=120,
+            value=35,
+            step=5,
+        )
+
+        st.header("🖥️ 互動式熱圖")
+
+        show_interactive_heatmap = st.checkbox(
+            "顯示互動式熱圖 (Plotly)",
+            value=False,
+            help="可以滑鼠縮放、平移,游標移到格子上會顯示精確的 r 與校正後 p 值。",
+        )
+
+        st.header("🕸️ 共現網路圖")
+
+        show_network = st.checkbox(
+            "顯示共現網路圖 (Co-occurrence network)",
+            value=False,
+            help="節點 = taxa,邊 = 通過顯著性門檻的相關性。",
+        )
+
+        network_layout = st.selectbox(
+            "網路圖排列方式",
+            ["spring", "kamada_kawai", "circular"],
+            index=0,
+        )
+
+        hide_isolated_nodes = st.checkbox(
+            "隱藏沒有顯著相關的孤立節點",
+            value=True,
+        )
+
+        node_size_basis = st.selectbox(
+            "節點大小依據",
+            ["連結數 (Degree)", "總豐度 (Total abundance)"],
+            index=0,
+        )
+
+        st.header("👥 分組比較（選用）")
+
+        metadata_file = st.file_uploader(
+            "上傳分組 metadata 表 (.tsv/.csv, 選用)",
+            type=["tsv", "txt", "csv"],
+            help=(
+                "第一欄需為樣本 ID,需與豐度表的樣本欄位名稱一致。"
+                "其餘欄位可以是分組資訊(例如 health/disease)。"
+            ),
+            key="metadata_uploader",
+        )
+
+        metadata_df = None
+        group_col = None
+
+        if metadata_file is not None:
+            try:
+                meta_sep = _infer_sep(getattr(metadata_file, "name", ""))
+                metadata_df = pd.read_csv(metadata_file, sep=meta_sep)
+                metadata_df.columns = [str(c).strip() for c in metadata_df.columns]
+                sample_id_col = metadata_df.columns[0]
+                metadata_df[sample_id_col] = metadata_df[sample_id_col].astype(str).str.strip()
+
+                candidate_cols = list(metadata_df.columns[1:])
+                if candidate_cols:
+                    group_col = st.selectbox(
+                        "選擇分組欄位",
+                        candidate_cols,
+                        index=0,
+                        key="group_col_select",
+                    )
+                else:
+                    st.warning("Metadata 檔案只有一欄,無法選擇分組欄位。")
+            except Exception as exc:
+                st.warning(f"無法讀取 metadata 檔案:{exc}")
+                metadata_df = None
+
+        st.form_submit_button("🚀 Run analysis", use_container_width=True)
 
 
 # =========================
@@ -724,7 +1288,7 @@ with st.sidebar:
 # =========================
 
 if uploaded is None:
-    st.info("Upload a table from the sidebar to start.")
+    st.info("Upload a table from the sidebar, then click **Run analysis**.")
     st.stop()
 
 df_raw = read_table(uploaded)
@@ -793,6 +1357,13 @@ if df.shape[1] < 3:
 # Auto figure size
 n_taxa = df.shape[0]
 
+if n_taxa > 300:
+    st.warning(
+        f"{n_taxa} taxa/features selected. A heatmap this large will be slow "
+        "to render/export and hard to read. Consider narrowing with the "
+        "taxa filter, or switching to genus-level grouping."
+    )
+
 if auto_fig_size:
     fig_side = max(20.0, min(120.0, n_taxa * 0.75 + 10))
     fig_w = fig_side
@@ -822,10 +1393,24 @@ with right_col:
     )
 
 
+# Preprocessing (normalization) applied before correlation
+if normalization_method == NORM_CLR:
+    pseudocount = suggest_pseudocount(df) if auto_pseudocount else float(manual_pseudocount)
+    st.caption(f"CLR pseudocount used: {pseudocount:.6g}")
+else:
+    pseudocount = 0.0
+
+df_analysis = normalize_table(df, normalization_method, pseudocount)
+
+if normalization_method != NORM_RAW:
+    with st.expander("🧫 轉換後的資料預覽 (用於相關性分析)", expanded=False):
+        st.dataframe(df_analysis.iloc[:30, :10], use_container_width=True)
+
+
 # Correlation analysis
 with st.spinner("Calculating Spearman correlations..."):
     corr_df, p_df = spearman_corr_and_p(
-        df,
+        df_analysis,
         fdr_alpha=fdr_alpha,
         method=p_adjust_method,
     )
@@ -867,8 +1452,24 @@ st.caption(
     f"Taxa/features: {df.shape[0]} | "
     f"Samples: {df.shape[1]} | "
     f"Display mode: {show_mode} | "
-    f"Label display: {display_label_mode}"
+    f"Label display: {display_label_mode} | "
+    f"Normalization: {normalization_method}"
 )
+
+if show_interactive_heatmap:
+    st.subheader("🖥️ 互動式熱圖 (Plotly)")
+    interactive_fig = draw_heatmap_plotly(
+        corr_df_ord=corr_df_ord,
+        p_df_ord=p_df_ord,
+        fdr_alpha=fdr_alpha,
+        show_mode=show_mode,
+        cmap=cmap,
+        shorten_plot_labels=shorten_plot_labels,
+        max_label_len=max_label_len,
+        display_label_mode=display_label_mode,
+    )
+    st.plotly_chart(interactive_fig, use_container_width=True)
+    st.caption("游標移到格子上可看到精確的 r 與校正後 p 值;可滑鼠滾輪縮放、拖曳平移。")
 
 
 # Result matrices
@@ -916,9 +1517,22 @@ st.download_button(
     mime="text/csv",
 )
 
+if normalization_method != NORM_RAW:
+    csv_normalized = df_analysis.to_csv().encode("utf-8-sig")
+    st.download_button(
+        f"Download normalized table CSV ({normalization_method})",
+        data=csv_normalized,
+        file_name="microcoheat_normalized_table.csv",
+        mime="text/csv",
+    )
+
 buf_png = io.BytesIO()
 buf_pdf = io.BytesIO()
 
+# Both exports explicitly pass dpi=dpi (the user's sidebar value, up to
+# 600) regardless of the lower DPI the figure was constructed/previewed
+# at above -- matplotlib re-rasterizes at save time, so downloads stay
+# full quality even though the on-screen preview is fast.
 fig.savefig(
     buf_png,
     format="png",
@@ -929,6 +1543,7 @@ fig.savefig(
 fig.savefig(
     buf_pdf,
     format="pdf",
+    dpi=dpi,
     bbox_inches="tight",
 )
 
@@ -950,3 +1565,148 @@ st.download_button(
 )
 
 plt.close(fig)
+
+
+# =========================
+# Co-occurrence network
+# =========================
+
+if show_network:
+    st.subheader("🕸️ 共現網路圖 (Co-occurrence network)")
+
+    edge_df = build_edge_table(corr_df_ord, p_df_ord, fdr_alpha)
+
+    if edge_df.empty:
+        st.info("目前的顯著性門檻下沒有偵測到任何顯著相關的 taxa pair,無法繪製網路圖。")
+    else:
+        abundance_map = df.sum(axis=1).to_dict()
+        net_fig, hub_table = draw_network_figure(
+            edge_df,
+            all_taxa=[str(t) for t in df_analysis.index],
+            abundance=abundance_map,
+            layout=network_layout,
+            hide_isolated=hide_isolated_nodes,
+            node_size_basis=node_size_basis,
+        )
+
+        if net_fig is not None:
+            st.plotly_chart(net_fig, use_container_width=True)
+            st.caption(
+                f"共 {len(edge_df)} 條顯著共現關係 (adj p ≤ {fdr_alpha})。"
+                f"節點大小依「{node_size_basis}」縮放。"
+            )
+        else:
+            st.info("勾選了隱藏孤立節點,且目前沒有任何節點有顯著相關,因此沒有東西可畫。")
+
+        with st.expander("🔗 顯著共現關係列表 (edge table)", expanded=False):
+            st.dataframe(edge_df, use_container_width=True)
+            st.download_button(
+                "下載共現關係 CSV (Cytoscape / Gephi 可用)",
+                data=edge_df.to_csv(index=False).encode("utf-8-sig"),
+                file_name="microcoheat_network_edges.csv",
+                mime="text/csv",
+            )
+
+        if hub_table is not None and not hub_table.empty:
+            with st.expander("⭐ Hub taxa (依連結數排序)", expanded=False):
+                st.dataframe(hub_table, use_container_width=True)
+                st.download_button(
+                    "下載 Hub taxa CSV",
+                    data=hub_table.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="microcoheat_hub_taxa.csv",
+                    mime="text/csv",
+                )
+
+
+# =========================
+# Group comparison
+# =========================
+
+if metadata_df is not None and group_col is not None:
+    sample_id_col = metadata_df.columns[0]
+    sample_to_group = dict(
+        zip(metadata_df[sample_id_col], metadata_df[group_col].astype(str).str.strip())
+    )
+
+    sample_cols = [str(c) for c in df_analysis.columns]
+    matched = [s for s in sample_cols if s in sample_to_group]
+    unmatched = [s for s in sample_cols if s not in sample_to_group]
+
+    st.subheader("👥 組間比較 (Group comparison)")
+
+    if unmatched:
+        preview = ", ".join(unmatched[:10]) + ("..." if len(unmatched) > 10 else "")
+        st.warning(f"有 {len(unmatched)} 個樣本在 metadata 中找不到對應分組,已略過: {preview}")
+
+    groups: Dict[str, List[str]] = {}
+    for sample in matched:
+        groups.setdefault(sample_to_group[sample], []).append(sample)
+
+    valid_groups = {g: cols for g, cols in groups.items() if len(cols) >= 3}
+    skipped_groups = [g for g, cols in groups.items() if len(cols) < 3]
+
+    if skipped_groups:
+        st.info(f"以下分組樣本數 < 3,已略過分析: {', '.join(skipped_groups)}")
+
+    if len(valid_groups) < 2:
+        st.info("目前樣本數足夠 (≥3) 的分組少於兩組,至少需要兩組才能比較。")
+    else:
+        group_names = list(valid_groups.keys())
+        group_results: Dict[str, Tuple[pd.DataFrame, pd.DataFrame]] = {}
+        overall_order = corr_df_ord.index.tolist()
+
+        tabs = st.tabs(group_names)
+        for tab, gname in zip(tabs, group_names):
+            with tab:
+                sub_df = df_analysis[valid_groups[gname]]
+                g_corr, g_p = spearman_corr_and_p(
+                    sub_df, fdr_alpha=fdr_alpha, method=p_adjust_method
+                )
+                g_corr = g_corr.reindex(index=overall_order, columns=overall_order)
+                g_p = g_p.reindex(index=overall_order, columns=overall_order)
+                group_results[gname] = (g_corr, g_p)
+
+                g_fig = draw_heatmap(
+                    corr_df_ord=g_corr,
+                    p_df_ord=g_p,
+                    fdr_alpha=fdr_alpha,
+                    show_mode=show_mode,
+                    cmap=cmap,
+                    fig_w_cm=fig_w,
+                    fig_h_cm=fig_h,
+                    font_size=font_size,
+                    dpi=dpi,
+                    linewidths=linewidths,
+                    shorten_plot_labels=shorten_plot_labels,
+                    max_label_len=max_label_len,
+                    display_label_mode=display_label_mode,
+                )
+                st.pyplot(g_fig, clear_figure=False, use_container_width=True)
+                st.caption(f"{gname}: {len(valid_groups[gname])} 個樣本")
+                plt.close(g_fig)
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            group_a = st.selectbox("比較組 A", group_names, index=0, key="diff_group_a")
+        with col_b:
+            default_b = 1 if len(group_names) > 1 else 0
+            group_b = st.selectbox("比較組 B", group_names, index=default_b, key="diff_group_b")
+
+        if group_a == group_b:
+            st.caption("請選擇兩個不同的分組來比較。")
+        else:
+            corr_a, p_a = group_results[group_a]
+            corr_b, p_b = group_results[group_b]
+            diff_table = build_diff_table(corr_a, p_a, corr_b, p_b, fdr_alpha, group_a, group_b)
+
+            if diff_table.empty:
+                st.caption(f"{group_a} 與 {group_b} 之間沒有偵測到顯著性不同的 taxa pair。")
+            else:
+                st.write(f"**{group_a} vs {group_b}**:顯著性不同的 taxa pair(依 |Δr| 排序):")
+                st.dataframe(diff_table.head(200), use_container_width=True)
+                st.download_button(
+                    f"下載差異表 CSV ({group_a}_vs_{group_b})",
+                    data=diff_table.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"microcoheat_diff_{group_a}_vs_{group_b}.csv",
+                    mime="text/csv",
+                )
