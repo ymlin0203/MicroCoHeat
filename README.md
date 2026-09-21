@@ -24,6 +24,17 @@ streamlit run app_microcoheat.py
 > `plotly`, `networkx`) are only imported the first time you actually use
 > the feature that needs them, not at startup.
 
+> **Note on "Oh no. Error running app.":** Streamlit Community Cloud has a
+> known, currently-unresolved bug where it ignores `runtime.txt` and always
+> builds with a newer Python than requested. If that newer Python has no
+> installable wheel for an old, tightly-pinned dependency (e.g. `numpy<2`),
+> the deploy fails with this generic error page and no useful traceback.
+> `requirements.txt` in this repo deliberately does **not** cap `numpy`/`pandas`
+> at `<2`/`<3` for this reason — the app is tested against both dependency
+> lines. If you ever see this error again, check **Manage app → Logs** on
+> Streamlit Cloud first; a `ResolutionImpossible` or build failure during
+> "Processing dependencies" points at a version pin, not application code.
+
 ## 📄 Input
 - `genus-table.tsv` or `.csv` with the **first column as taxonomy/feature ID** (index).
 - Filtering preserves duplicate genera (strict last-rank match), matching the CLI workflow.
