@@ -51,10 +51,10 @@ streamlit run app_microcoheat.py
 - Hierarchical clustering on `1 - r` after symmetrization and setting diagonal = 1; default linkage is `average`, `ward` is also available in the sidebar
 
 ## 🧫 Optional preprocessing (new)
-Microbiome abundance data is *compositional* (every sample's taxa necessarily sum to a fixed total), which can make Spearman correlation on raw counts produce spurious relationships. The sidebar now offers:
+Microbiome abundance data is *compositional* (every sample's taxa necessarily sum to a fixed total), which can make Spearman correlation on raw counts produce spurious relationships (Aitchison, 1986; Gloor et al., 2017, "Microbiome Datasets Are Compositional"). The sidebar now offers:
 - **Raw values** — no transform (default; matches all previous behavior).
-- **Relative abundance (TSS)** — divide each sample by its own total.
-- **CLR (centered log-ratio)** — the standard compositional-data transform. Unlike TSS, this changes the *rank order across samples* for a given taxon (the per-sample geometric mean differs sample to sample), so it can genuinely change which correlations come out significant, not just rescale them. A pseudocount (auto-suggested as half the smallest non-zero value in the table, or set manually) avoids `log(0)`.
+- **Relative abundance (TSS)** — divide each sample by its own total. This only corrects for sequencing-depth differences; it does **not** resolve the compositional "constant sum" artifact, and because each sample is divided by a different total, TSS can still change a given taxon's rank order across samples (it isn't a pure rescaling relative to raw counts, any more than CLR is).
+- **CLR (centered log-ratio)** — the transform actually recommended in the compositional-data literature for this, since it replaces raw abundances with log-ratios to each sample's own geometric mean, which is what breaks the constant-sum artifact. A pseudocount (auto-suggested as half the smallest non-zero value in the table, or set manually) avoids `log(0)`. **If this analysis is going into a publication, CLR is the defensible default to report** — state whichever method was actually used in the methods section.
 
 ## 🖥️ Optional interactive heatmap (new)
 Alongside the static (downloadable) heatmap, you can enable a Plotly version with the same clustering order and significance mask — zoomable/pannable, with exact `r` and adjusted `p` on hover.
@@ -68,6 +68,12 @@ Turns the same significant pairs used in the heatmap into a network graph (nodes
 
 ## 👥 Optional group comparison (new)
 Upload a metadata table (first column = sample ID, matching the abundance table's sample columns; any other column can be chosen as the grouping variable). For every group with ≥3 samples, MicroCoHeat computes its own correlation matrix (aligned to the same taxon order as the overall heatmap, for visual comparability) and shows it in its own tab. Pick any two groups to get a table of taxa pairs whose significance status differs between them (e.g. present in Disease, absent in Healthy), sorted by `|Δr|`, with a CSV download.
+
+## ⚠️ Statistical caveats (read before using this for a publication)
+- **The group-comparison diff table is a screening tool, not a hypothesis test.** "Significant in group A, not significant in group B" is not itself a test that the two correlations differ — two correlations that are barely distinguishable (e.g. r=0.50, p=0.04 vs r=0.45, p=0.06) will show up as "differing" here (Gelman & Stern, 2006). Use it to rank/shortlist candidate pairs, not to cite a row as a significant between-group difference. A defensible claim needs a direct test for the difference between two correlation coefficients (e.g. Fisher r-to-z), which this app does not currently compute.
+- **Undefined correlations inside a group are silently set to r=0, adj_p=1.** A taxon that is invariant within one group's subset (even if it varies overall) makes Spearman's r/p undefined (NaN) for every pair involving it in that group; these are treated as "not significant" rather than excluded. Worth checking for and disclosing if a group has taxa with zero within-group variance.
+- **Very small sample sizes are mathematically limited, not just underpowered.** With n=3 samples, no correlation can reach p < 0.05 two-tailed even at r = ±1 (the smallest possible two-tailed p-value is 1/3), and scipy's p-value uses an asymptotic (t-distribution) approximation regardless of n, which is unreliable for small samples generally. The app warns below 10 samples; treat results from very small groups as exploratory.
+- **Reproducibility:** "⬇️ Download results" includes a `microcoheat_analysis_parameters.txt` with every setting used for that run (normalization + pseudocount, FDR method/alpha, clustering linkage, taxa filters, label mode) — useful for an accurate methods section or for reproducing a figure later.
 
 ## 🖼️ Output
 - Heatmap (PNG/PDF, static) and, optionally, an interactive Plotly heatmap

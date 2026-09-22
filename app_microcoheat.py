@@ -370,13 +370,22 @@ def normalize_table(df: pd.DataFrame, method: str, pseudocount: float) -> pd.Dat
 
     Spearman correlation computed directly on raw counts/relative-abundance
     values can be sensitive to the "compositional" nature of microbiome
-    data (all taxa in a sample necessarily sum to a fixed total, which can
-    induce spurious negative correlations). TSS just removes sequencing-
-    depth differences; CLR (centered log-ratio) is the standard
-    compositional-data transform and changes the *rank order across
-    samples* for a given taxon (since the per-sample geometric mean
-    differs sample to sample), so it can meaningfully change Spearman
-    results, not just rescale them.
+    data (all taxa in a sample necessarily sum to a fixed total, which
+    induces spurious correlations -- Aitchison 1986; Gloor et al. 2017,
+    "Microbiome Datasets Are Compositional").
+
+    IMPORTANT for methods write-ups: TSS only corrects for sequencing-depth
+    differences (dividing by each sample's own total) -- it does NOT
+    resolve the compositional "constant sum" artifact itself, and because
+    the divisor differs sample to sample, TSS *can* change a given taxon's
+    rank order across samples too, same as CLR (it is not a pure, rank-
+    preserving rescaling relative to raw counts). CLR (centered log-ratio)
+    is the transform from the compositional-data literature that actually
+    addresses the constant-sum artifact, by replacing raw abundances with
+    log-ratios to each sample's own geometric mean. If this analysis is
+    going into a publication, CLR is the defensible default to report, not
+    TSS or raw counts, and the normalization method used should be stated
+    explicitly in the methods section.
     """
     if method == NORM_RAW:
         return df
@@ -426,8 +435,24 @@ def spearman_corr_and_p(
     code) instead of looping over every (i, j) pair in Python.
 
     FDR correction:
-    - Only upper triangle without diagonal is corrected.
+    - Only upper triangle without diagonal is corrected (the diagonal is
+      not a real test, and correcting it too would understate the
+      significance of every real pair).
     - Corrected p-values are mirrored back to the full matrix.
+
+    CAVEAT for methods write-ups: a Spearman correlation is undefined
+    (scipy returns NaN) whenever one of the two taxa has zero variance
+    across the samples being tested -- this is checked and filtered out
+    for the *overall* table (see prepare_taxa_table's variance filter),
+    but it can still happen inside a single group's subset in the group-
+    comparison feature (e.g. a taxon that is invariant within "Healthy"
+    even though it varies overall). Those NaN pairs are silently set to
+    r=0, adj_p=1 (i.e. treated as "not significant") rather than left
+    undefined/excluded, so they don't crash the heatmap or downstream FDR
+    correction. If reporting group-specific results, it's worth checking
+    each group's data for taxa with zero within-group variance and noting
+    how they were handled, rather than assuming every r=0 reflects a
+    genuinely tested null result.
     """
     from statsmodels.stats.multitest import multipletests
 
@@ -729,9 +754,25 @@ def build_diff_table(
 ) -> pd.DataFrame:
     """
     Taxa pairs whose significance status (significant vs not, at the same
-    FDR threshold) differs between two groups, sorted by |Δr| descending.
-    A quick way to spot co-occurrence relationships that appear in one
-    condition (e.g. disease) but not the other (e.g. healthy).
+    FDR threshold) differs between two groups, sorted by |delta_r|
+    descending. A quick way to spot co-occurrence relationships that
+    appear in one condition (e.g. disease) but not the other (e.g.
+    healthy).
+
+    STATISTICAL CAVEAT, important if this feeds a publication: "significant
+    in group A but not group B" is NOT itself a statistical test that the
+    two correlations differ, and treating it as one is a well-known
+    fallacy (Gelman & Stern, 2006, "The difference between 'significant'
+    and 'not significant' is not itself statistically significant" -- e.g.
+    r=0.50 (p=0.04) in a group of 20 vs r=0.45 (p=0.06) in another group of
+    20 would show up here as "differs," even though those two correlations
+    are barely distinguishable). This table is a fast screening/ranking
+    tool, not a per-pair hypothesis test. For a defensible claim that a
+    specific taxa pair's co-occurrence differs between groups, use a direct
+    test for the difference between two correlation coefficients (e.g. a
+    Fisher r-to-z comparison of the two group's correlations, which is not
+    currently computed here) rather than citing this table's rows as
+    significant differences on their own.
     """
     taxa = np.array(corr_a.index.astype(str))
     n = len(taxa)
@@ -1103,11 +1144,15 @@ with st.sidebar:
             index=0,
             help=(
                 "微生物體豐度資料具有「組成性」(compositional):同一樣本內所有 "
-                "taxa 的總和固定,直接對 raw counts 做 Spearman 有時會產生假的負相關。"
-                "TSS 只校正定序深度;CLR (centered log-ratio) 是組成性資料分析的"
-                "標準轉換,會改變每個 taxon 在樣本間的排序(因為每個樣本的幾何平均"
-                "不同),因此可能讓相關係數結果明顯不同,不只是縮放。預設為不轉換,"
-                "與舊版行為一致。"
+                "taxa 的總和固定,直接對 raw counts 做 Spearman 容易產生假的負相關"
+                "(Aitchison, 1986; Gloor et al., 2017)。"
+                "⚠️ TSS(相對豐度)只校正定序深度差異,並**沒有解決**組成性資料本身"
+                "「總和固定」造成的假相關問題,而且因為每個樣本除以的分母(該樣本總和)"
+                "不同,同一個 taxon 在不同樣本間的排序其實也會被改變,不是單純縮放。"
+                "CLR (centered log-ratio) 才是文獻上處理組成性資料相關性分析的標準轉換,"
+                "會用對數比值取代原始豐度,才真正打破「總和固定」造成的人為負相關結構。"
+                "若要投稿發表,建議優先使用 CLR,並在方法段落說明所使用的轉換方式。"
+                "預設為不轉換,與舊版行為一致。"
             ),
         )
 
@@ -1419,9 +1464,22 @@ if df.shape[0] < 2:
 
 if df.shape[1] < 3:
     st.warning(
-        "At least three samples are recommended for Spearman correlation."
+        "At least three samples are required to compute a Spearman "
+        "correlation at all."
     )
     st.stop()
+
+if df.shape[1] < 10:
+    st.warning(
+        f"Only {df.shape[1]} samples. Spearman's p-value here uses scipy's "
+        "asymptotic (t-distribution) approximation regardless of sample "
+        "size, which is unreliable for very small n -- with n=3, no "
+        "correlation can reach p < 0.05 two-tailed even at r = ±1 (the "
+        "smallest possible two-tailed p-value is 1/3). Results from this "
+        "few samples are exploratory; if this is going into a publication, "
+        "note the small n as a limitation, or collect more samples before "
+        "drawing conclusions from significance."
+    )
 
 
 # Auto figure size
@@ -1581,6 +1639,38 @@ with st.expander("📊 Adjusted P-value matrix, same order", expanded=False):
 # =========================
 
 st.subheader("⬇️ Download results")
+
+# A plain-text summary of every setting that affects the numbers above --
+# for reproducibility / writing an accurate methods section. None of this
+# is re-derived from the data, it's just a record of what was actually
+# selected in the sidebar for this run.
+_params_lines = [
+    "MicroCoHeat analysis parameters",
+    "================================",
+    f"Taxa/features analyzed: {df.shape[0]}",
+    f"Samples analyzed: {df.shape[1]}",
+    f"Taxa label mode: {label_mode}",
+    f"Manual taxa filter: {'(none)' if not taxa_list else f'{len(taxa_list)} term(s), {match_mode}, case_sensitive={case_sensitive}'}",
+    f"Top-N by abundance filter: {f'top {int(top_n)}' if top_n_enabled else '(not applied)'}",
+    f"Normalization: {normalization_method}"
+    + (f" (pseudocount={pseudocount:.6g})" if normalization_method == NORM_CLR else ""),
+    f"Correlation method: Spearman",
+    f"P-value adjustment: {p_adjust_method}",
+    f"FDR alpha: {fdr_alpha}",
+    f"Clustering linkage: {cluster_method}",
+    f"Heatmap display mode: {show_mode}",
+]
+st.download_button(
+    "Download analysis parameters (.txt)",
+    data=("\n".join(_params_lines) + "\n").encode("utf-8"),
+    file_name="microcoheat_analysis_parameters.txt",
+    mime="text/plain",
+    help=(
+        "A record of every setting used for this run (normalization, FDR "
+        "method/alpha, clustering, filters) -- for reproducing the analysis "
+        "or writing the methods section."
+    ),
+)
 
 csv_corr = corr_df_ord.to_csv().encode("utf-8-sig")
 csv_p = p_df_ord.to_csv().encode("utf-8-sig")
@@ -1837,6 +1927,14 @@ if metadata_df is not None and group_col is not None:
                 st.caption(f"{group_a} 與 {group_b} 之間沒有偵測到顯著性不同的 taxa pair。")
             else:
                 st.write(f"**{group_a} vs {group_b}**:顯著性不同的 taxa pair(依 |Δr| 排序):")
+                st.caption(
+                    "⚠️ 這張表是「A 組顯著、B 組不顯著」(或反之)的篩選結果,"
+                    "**不是**兩組相關係數差異的統計檢定——這是統計上有名的謬誤"
+                    "(顯著 vs 不顯著,兩者本身的差距不一定顯著;Gelman & Stern, 2006)。"
+                    "適合用來快速篩選/排序候選 taxa pair,若要在論文中主張某個 pair "
+                    "在兩組間「顯著不同」,需要另外對兩個相關係數做直接比較的檢定"
+                    "(例如 Fisher r-to-z),而不是引用這張表本身。"
+                )
                 st.dataframe(diff_table.head(200), width="stretch")
                 st.download_button(
                     f"下載差異表 CSV ({group_a}_vs_{group_b})",
