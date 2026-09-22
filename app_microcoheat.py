@@ -784,6 +784,30 @@ def build_diff_table(
 # every interactive redraw slow too.
 _PREVIEW_DPI_CAP = 150
 
+# Hard safety ceiling for PNG/PDF *export* rendering. With "Auto figure size"
+# on, the figure side can reach up to 120 cm for large taxa counts, and DPI
+# defaults to 600 -- at that combination a raster buffer would be roughly
+# 28,000 x 28,000 px (~3 GB just for one RGBA buffer), which reliably OOM-
+# kills the process on Streamlit Community Cloud's free-tier memory limit
+# (this is what "big tables crash the app" turned out to be: not a bug
+# triggered by any specific taxa, but the eager, uncapped-DPI PNG+PDF export
+# that used to run automatically on every "Run analysis", regardless of
+# whether the user ever clicked download). This cap silently reduces the
+# *effective* export DPI (never the on-screen preview, which already has
+# its own cap above) so the exported raster's longer side never exceeds
+# this many pixels, and the UI shows the user the DPI actually used.
+_MAX_EXPORT_PIXELS_PER_SIDE = 12000
+
+
+def _capped_export_dpi(fig_w_cm: float, fig_h_cm: float, requested_dpi: int) -> int:
+    """Return the largest DPI <= requested_dpi that keeps both the width and
+    height of the exported raster under _MAX_EXPORT_PIXELS_PER_SIDE pixels."""
+    longer_side_in = max(fig_w_cm, fig_h_cm) / 2.54
+    if longer_side_in <= 0:
+        return requested_dpi
+    max_dpi_for_cap = int(_MAX_EXPORT_PIXELS_PER_SIDE / longer_side_in)
+    return max(72, min(requested_dpi, max_dpi_for_cap))
+
 
 def draw_heatmap(
     corr_df_ord: pd.DataFrame,
@@ -1536,43 +1560,80 @@ if normalization_method != NORM_RAW:
         mime="text/csv",
     )
 
-buf_png = io.BytesIO()
-buf_pdf = io.BytesIO()
+st.markdown("**🖼️ Heatmap PNG / PDF export**")
 
-# Both exports explicitly pass dpi=dpi (the user's sidebar value, up to
-# 600) regardless of the lower DPI the figure was constructed/previewed
-# at above -- matplotlib re-rasterizes at save time, so downloads stay
-# full quality even though the on-screen preview is fast.
-fig.savefig(
-    buf_png,
-    format="png",
-    dpi=dpi,
-    bbox_inches="tight",
+effective_export_dpi = _capped_export_dpi(fig_w, fig_h, dpi)
+if effective_export_dpi < dpi:
+    st.caption(
+        f"⚠️ Requested {dpi} DPI at this figure size would need a raster "
+        f"over {_MAX_EXPORT_PIXELS_PER_SIDE:,}px on a side (too much memory "
+        f"for the free-tier server). Export DPI automatically reduced to "
+        f"{effective_export_dpi} for the PNG/PDF download below; the "
+        f"on-screen heatmap above is unaffected."
+    )
+
+# Export signature: only these inputs affect the rendered PNG/PDF, so the
+# cached bytes below stay valid across reruns caused by clicking a download
+# button itself, and are only recomputed when something that would actually
+# change the image changes.
+_export_sig = (
+    tuple(corr_df_ord.columns),
+    show_mode,
+    cmap,
+    fig_w,
+    fig_h,
+    font_size,
+    effective_export_dpi,
+    linewidths,
+    shorten_plot_labels,
+    max_label_len,
+    display_label_mode,
 )
 
-fig.savefig(
-    buf_pdf,
-    format="pdf",
-    dpi=dpi,
-    bbox_inches="tight",
-)
+# Generating both a PNG and a PDF at export quality is the single most
+# expensive step in the whole app for a large heatmap (previously ran
+# unconditionally on every "Run analysis", which is what made big tables
+# crash the deployed app -- see _MAX_EXPORT_PIXELS_PER_SIDE above). Gating
+# it behind an explicit button means a user who only wants to look at the
+# on-screen heatmap, or download the CSVs, never pays that cost.
+if st.button("🖼️ Generate PNG / PDF for download", key="generate_heatmap_export"):
+    with st.spinner("Rendering export-quality PNG/PDF..."):
+        buf_png = io.BytesIO()
+        buf_pdf = io.BytesIO()
 
-buf_png.seek(0)
-buf_pdf.seek(0)
+        fig.savefig(
+            buf_png,
+            format="png",
+            dpi=effective_export_dpi,
+            bbox_inches="tight",
+        )
+        fig.savefig(
+            buf_pdf,
+            format="pdf",
+            dpi=effective_export_dpi,
+            bbox_inches="tight",
+        )
 
-st.download_button(
-    "Download heatmap PNG",
-    data=buf_png,
-    file_name="microcoheat_heatmap.png",
-    mime="image/png",
-)
+        st.session_state["heatmap_export_sig"] = _export_sig
+        st.session_state["heatmap_export_png"] = buf_png.getvalue()
+        st.session_state["heatmap_export_pdf"] = buf_pdf.getvalue()
 
-st.download_button(
-    "Download heatmap PDF",
-    data=buf_pdf,
-    file_name="microcoheat_heatmap.pdf",
-    mime="application/pdf",
-)
+if st.session_state.get("heatmap_export_sig") == _export_sig:
+    st.download_button(
+        "Download heatmap PNG",
+        data=st.session_state["heatmap_export_png"],
+        file_name="microcoheat_heatmap.png",
+        mime="image/png",
+    )
+
+    st.download_button(
+        "Download heatmap PDF",
+        data=st.session_state["heatmap_export_pdf"],
+        file_name="microcoheat_heatmap.pdf",
+        mime="application/pdf",
+    )
+elif "heatmap_export_sig" in st.session_state:
+    st.caption("Settings changed since the last export -- click the button above to regenerate.")
 
 plt.close(fig)
 
