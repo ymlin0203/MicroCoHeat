@@ -1280,7 +1280,7 @@ with st.sidebar:
                 st.warning(f"無法讀取 metadata 檔案:{exc}")
                 metadata_df = None
 
-        st.form_submit_button("🚀 Run analysis", use_container_width=True)
+        st.form_submit_button("🚀 Run analysis", width="stretch")
 
 
 # =========================
@@ -1303,7 +1303,7 @@ st.success(
 with st.expander("🔍 Raw uploaded table preview", expanded=False):
     st.dataframe(
         df_raw.iloc[:10, :10],
-        use_container_width=True,
+        width="stretch",
     )
 
 taxa_list = parse_manual_taxa(taxa_input)
@@ -1331,7 +1331,7 @@ if missing_terms:
         st.write("These terms were not matched:")
         st.dataframe(
             pd.DataFrame({"Not found": missing_terms}),
-            use_container_width=True,
+            width="stretch",
         )
 
 if df.empty:
@@ -1380,7 +1380,7 @@ with left_col:
     st.subheader("🧾 Taxa/features used for analysis")
     st.dataframe(
         pd.DataFrame({"Taxa / Feature": df.index}),
-        use_container_width=True,
+        width="stretch",
         height=360,
     )
 
@@ -1388,7 +1388,7 @@ with right_col:
     st.subheader("📋 Processed abundance table preview")
     st.dataframe(
         df.iloc[:30, :10],
-        use_container_width=True,
+        width="stretch",
         height=360,
     )
 
@@ -1404,7 +1404,7 @@ df_analysis = normalize_table(df, normalization_method, pseudocount)
 
 if normalization_method != NORM_RAW:
     with st.expander("🧫 轉換後的資料預覽 (用於相關性分析)", expanded=False):
-        st.dataframe(df_analysis.iloc[:30, :10], use_container_width=True)
+        st.dataframe(df_analysis.iloc[:30, :10], width="stretch")
 
 
 # Correlation analysis
@@ -1444,7 +1444,7 @@ fig = draw_heatmap(
 st.pyplot(
     fig,
     clear_figure=False,
-    use_container_width=True,
+    width="stretch",
 )
 
 st.caption(
@@ -1468,7 +1468,7 @@ if show_interactive_heatmap:
         max_label_len=max_label_len,
         display_label_mode=display_label_mode,
     )
-    st.plotly_chart(interactive_fig, use_container_width=True)
+    st.plotly_chart(interactive_fig, width="stretch")
     st.caption("游標移到格子上可看到精確的 r 與校正後 p 值;可滑鼠滾輪縮放、拖曳平移。")
 
 
@@ -1476,13 +1476,13 @@ if show_interactive_heatmap:
 with st.expander("📊 Correlation matrix, clustered order", expanded=False):
     st.dataframe(
         corr_df_ord,
-        use_container_width=True,
+        width="stretch",
     )
 
 with st.expander("📊 Adjusted P-value matrix, same order", expanded=False):
     st.dataframe(
         p_df_ord,
-        use_container_width=True,
+        width="stretch",
     )
 
 
@@ -1590,7 +1590,7 @@ if show_network:
         )
 
         if net_fig is not None:
-            st.plotly_chart(net_fig, use_container_width=True)
+            st.plotly_chart(net_fig, width="stretch")
             st.caption(
                 f"共 {len(edge_df)} 條顯著共現關係 (adj p ≤ {fdr_alpha})。"
                 f"節點大小依「{node_size_basis}」縮放。"
@@ -1599,7 +1599,7 @@ if show_network:
             st.info("勾選了隱藏孤立節點,且目前沒有任何節點有顯著相關,因此沒有東西可畫。")
 
         with st.expander("🔗 顯著共現關係列表 (edge table)", expanded=False):
-            st.dataframe(edge_df, use_container_width=True)
+            st.dataframe(edge_df, width="stretch")
             st.download_button(
                 "下載共現關係 CSV (Cytoscape / Gephi 可用)",
                 data=edge_df.to_csv(index=False).encode("utf-8-sig"),
@@ -1609,7 +1609,7 @@ if show_network:
 
         if hub_table is not None and not hub_table.empty:
             with st.expander("⭐ Hub taxa (依連結數排序)", expanded=False):
-                st.dataframe(hub_table, use_container_width=True)
+                st.dataframe(hub_table, width="stretch")
                 st.download_button(
                     "下載 Hub taxa CSV",
                     data=hub_table.to_csv(index=False).encode("utf-8-sig"),
@@ -1681,7 +1681,7 @@ if metadata_df is not None and group_col is not None:
                     max_label_len=max_label_len,
                     display_label_mode=display_label_mode,
                 )
-                st.pyplot(g_fig, clear_figure=False, use_container_width=True)
+                st.pyplot(g_fig, clear_figure=False, width="stretch")
                 st.caption(f"{gname}: {len(valid_groups[gname])} 個樣本")
                 plt.close(g_fig)
 
@@ -1703,7 +1703,7 @@ if metadata_df is not None and group_col is not None:
                 st.caption(f"{group_a} 與 {group_b} 之間沒有偵測到顯著性不同的 taxa pair。")
             else:
                 st.write(f"**{group_a} vs {group_b}**:顯著性不同的 taxa pair(依 |Δr| 排序):")
-                st.dataframe(diff_table.head(200), use_container_width=True)
+                st.dataframe(diff_table.head(200), width="stretch")
                 st.download_button(
                     f"下載差異表 CSV ({group_a}_vs_{group_b})",
                     data=diff_table.to_csv(index=False).encode("utf-8-sig"),
