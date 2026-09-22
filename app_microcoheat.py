@@ -1495,27 +1495,47 @@ with st.spinner("Calculating Spearman correlations..."):
 # Heatmap
 st.subheader("🔥 Co-occurrence heatmap")
 
-fig = draw_heatmap(
-    corr_df_ord=corr_df_ord,
-    p_df_ord=p_df_ord,
-    fdr_alpha=fdr_alpha,
-    show_mode=show_mode,
-    cmap=cmap,
-    fig_w_cm=fig_w,
-    fig_h_cm=fig_h,
-    font_size=font_size,
-    dpi=dpi,
-    linewidths=linewidths,
-    shorten_plot_labels=shorten_plot_labels,
-    max_label_len=max_label_len,
-    display_label_mode=display_label_mode,
-)
 
-st.pyplot(
-    fig,
-    clear_figure=False,
-    width="stretch",
-)
+def _build_static_fig() -> plt.Figure:
+    """Build the static matplotlib heatmap. Factored out so it can be
+    skipped entirely (not just hidden) when the interactive Plotly heatmap
+    is showing the same clustered matrix, and built lazily later only if
+    the user actually asks for a PNG/PDF export -- see the export button
+    below. Rendering this is one of the more expensive steps for a large
+    heatmap (seconds, even at the capped preview DPI), so previously
+    computing and displaying it unconditionally meant every "Run analysis"
+    paid that cost even when the interactive view made it redundant."""
+    return draw_heatmap(
+        corr_df_ord=corr_df_ord,
+        p_df_ord=p_df_ord,
+        fdr_alpha=fdr_alpha,
+        show_mode=show_mode,
+        cmap=cmap,
+        fig_w_cm=fig_w,
+        fig_h_cm=fig_h,
+        font_size=font_size,
+        dpi=dpi,
+        linewidths=linewidths,
+        shorten_plot_labels=shorten_plot_labels,
+        max_label_len=max_label_len,
+        display_label_mode=display_label_mode,
+    )
+
+
+fig = None  # built below, or lazily by the export button further down
+
+if show_interactive_heatmap:
+    st.caption(
+        "互動式熱圖(下方)已取代這裡的靜態預覽,避免同一張圖畫兩次;"
+        "如需下載 PNG/PDF,仍可在下方按鈕產生(用同一組聚類結果)。"
+    )
+else:
+    fig = _build_static_fig()
+    st.pyplot(
+        fig,
+        clear_figure=False,
+        width="stretch",
+    )
 
 st.caption(
     f"Figure size: {fig_w:.1f} cm × {fig_h:.1f} cm | "
@@ -1634,6 +1654,12 @@ _export_sig = (
 # on-screen heatmap, or download the CSVs, never pays that cost.
 if st.button("🖼️ Generate PNG / PDF for download", key="generate_heatmap_export"):
     with st.spinner("Rendering export-quality PNG/PDF..."):
+        # fig is only pre-built above when the interactive heatmap is off;
+        # when it's on, this is the first (and only) time the static
+        # matplotlib figure gets rendered at all.
+        if fig is None:
+            fig = _build_static_fig()
+
         buf_png = io.BytesIO()
         buf_pdf = io.BytesIO()
 
@@ -1671,7 +1697,8 @@ if st.session_state.get("heatmap_export_sig") == _export_sig:
 elif "heatmap_export_sig" in st.session_state:
     st.caption("Settings changed since the last export -- click the button above to regenerate.")
 
-plt.close(fig)
+if fig is not None:
+    plt.close(fig)
 
 
 # =========================
