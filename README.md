@@ -39,6 +39,11 @@ streamlit run app_microcoheat.py
 - `genus-table.tsv` or `.csv` with the **first column as taxonomy/feature ID** (index).
 - Filtering preserves duplicate genera (strict last-rank match), matching the CLI workflow.
 
+## 🔎 Taxa filtering
+- **Taxa label mode** transforms the index (e.g. "Use species-level only" keeps just `Streptococcus_mitis` from a full `Bacteria|...|Streptococcus_mitis` path) *before* anything else runs, including the manual filter below.
+- **Manual filter** ("Enter bacteria names") matches against the label **after** that transform, not the original taxonomy string — a common source of "0 taxa after filtering": pasting the full path when the label mode has already shortened it to just the species/genus name. Match against whatever the label mode produces, or switch to "Use table labels as-is" to match full paths.
+- **🔝 Only keep the top N most abundant taxa** (new) — an alternative to typing names by hand: ranks taxa by total abundance summed across all samples and keeps only the top N, applied after the manual filter. Useful both to focus on the dominant taxa and to cut a very large table down to a size that's fast to cluster/render (see the performance notes below on why large tables used to crash the deployed app).
+
 ## 🧪 Method
 - Spearman with `axis=1` (vectorized: the whole correlation/p-value matrix is computed in one call, not pair-by-pair)
 - Benjamini–Hochberg FDR (`fdr_bh` by default; `bonferroni`, `holm`, `fdr_by`, `sidak`, `holm-sidak` and `ward`-eligible clustering are also selectable)

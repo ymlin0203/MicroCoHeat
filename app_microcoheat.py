@@ -1068,6 +1068,33 @@ with st.sidebar:
             value=False,
         )
 
+        st.caption(
+            "⚠️ 上面的手動篩選是跟「Taxa label mode」轉換**之後**的名稱比對,"
+            "不是原始 taxonomy 全路徑。例如 label mode 選 "
+            "\"Use species-level only\" 時,要輸入 `Streptococcus_mitis`,"
+            "而不是 `Bacteria|...|Streptococcus_mitis` 整串路徑,否則會完全比對不到、"
+            "篩選後變成 0 筆。"
+        )
+
+        top_n_enabled = st.checkbox(
+            "🔝 只保留總豐度前 N 名的 taxa",
+            value=False,
+            help=(
+                "依照每個 taxon 在所有樣本中的豐度總和排序,只保留前 N 名。"
+                "會在手動篩選之後套用,方便快速縮小到最主要的菌種,"
+                "也能大幅減少畫熱圖/網路圖的負擔。"
+            ),
+        )
+
+        top_n = st.number_input(
+            "N",
+            min_value=1,
+            max_value=1000,
+            value=20,
+            step=1,
+            disabled=not top_n_enabled,
+        )
+
         st.header("🧫 資料前處理 (Normalization)")
 
         normalization_method = st.selectbox(
@@ -1374,6 +1401,15 @@ if df.empty:
         "Please check bacteria names, label mode, or table format."
     )
     st.stop()
+
+if top_n_enabled:
+    total_abundance = df.sum(axis=1)
+    keep_index = total_abundance.sort_values(ascending=False).head(int(top_n)).index
+    df = df.loc[keep_index]
+    st.info(
+        f"🔝 只保留總豐度前 {int(top_n)} 名 taxa "
+        f"(依所有樣本加總後的豐度排序);目前剩下 {df.shape[0]} 筆。"
+    )
 
 if df.shape[0] < 2:
     st.warning(
