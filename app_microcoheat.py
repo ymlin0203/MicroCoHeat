@@ -304,7 +304,15 @@ def prepare_taxa_table(
 
         if match_mode == "Exact match":
             taxa_set = set(taxa_for_match)
-            keep_mask = np.array([x in taxa_set for x in index_for_match])
+            # dtype=bool is explicit here (not left to be inferred) because
+            # an empty df2 (0 taxa left after cleaning) makes this a list
+            # comprehension over zero elements, and np.array([]) defaults to
+            # float64 -- which then fails the `keep_mask | current_mask`
+            # bitwise-or below under numpy>=2's stricter ufunc casting rules
+            # (numpy<2 silently allowed it). This affects both match modes.
+            keep_mask = np.array(
+                [x in taxa_set for x in index_for_match], dtype=bool
+            )
 
             matched_terms = set(index_for_match[keep_mask])
             missing_terms = [
@@ -317,7 +325,9 @@ def prepare_taxa_table(
             matched_any = []
 
             for original, query in zip(taxa_list, taxa_for_match):
-                current_mask = np.array([query in x for x in index_for_match])
+                current_mask = np.array(
+                    [query in x for x in index_for_match], dtype=bool
+                )
                 keep_mask = keep_mask | current_mask
                 matched_any.append(bool(current_mask.any()))
 
